@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [15.0.1] - 2026-10-23
+
+### Added
+- **Privilege Auto-Elevation**: Automatically elevates with `sudo` when run by an unprivileged user, resolving the executable's absolute path and preserving CLI arguments.
+- **Secure-Path Provisioning**: Automatically provisions `/usr/local/bin/raid -> /mnt/shin6/git/raid/raid.py` upon root elevation so `sudo raid` is immediately available in restricted `secure_path` environments.
+
+---
+
 ## [15.0.0] - 2026-10-23
 
 ### Added

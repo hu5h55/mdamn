@@ -2,10 +2,10 @@
 
 ################################################################################
 # RAID Health Monitor
-# Version: 15.0.0 - Python
+# Version: 15.0.1 - Python
 ################################################################################
 
-VERSION = "15.0.0"
+VERSION = "15.0.1"
 
 import os
 import re
@@ -60,15 +60,44 @@ def usage_bar(pct, width=10):
     return f'{col}{"▰" * fill}{GRAY}{"▱" * empty}{RESET}'
 
 
+def check_privileges():
+    if os.geteuid() != 0:
+        script_path = sys.argv[0]
+        if not os.path.isabs(script_path):
+            script_path = shutil.which(script_path) or os.path.abspath(__file__)
+        else:
+            script_path = os.path.abspath(script_path)
+
+        if not shutil.which('sudo'):
+            print(f'\n{RED}ERROR: Root privileges required and sudo is not available.{RESET}\n', file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            # Re-execute via sudo preserving arguments and full executable path
+            os.execvp('sudo', ['sudo', script_path] + sys.argv[1:])
+        except Exception as e:
+            print(f'\n{RED}ERROR: Root privileges required.{RESET}', file=sys.stderr)
+            print(f'Re-run with: {WHITE}sudo {script_path}{RESET} ({e})\n', file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Running as root: ensure /usr/local/bin/raid symlink exists so 'sudo raid' works in secure_path
+        usr_bin = '/usr/local/bin/raid'
+        target = os.path.realpath(__file__)
+        if not os.path.exists(usr_bin) or os.path.realpath(usr_bin) != target:
+            try:
+                if os.path.islink(usr_bin) or os.path.exists(usr_bin):
+                    os.remove(usr_bin)
+                os.symlink(target, usr_bin)
+            except OSError:
+                pass
+
+
 def check_deps():
     for cmd in ('mdadm', 'parted', 'smartctl', 'lsblk'):
         if not shutil.which(cmd):
-            print(f'ERROR: Missing {cmd}', file=sys.stderr)
+            print(f'{RED}ERROR: Missing system dependency: {cmd}{RESET}', file=sys.stderr)
+            print(f'Install with: {WHITE}sudo apt install -y mdadm parted smartmontools util-linux{RESET}', file=sys.stderr)
             sys.exit(1)
-    if os.geteuid() != 0:
-        print(f'\n{RED}ERROR: Root privileges required.{RESET}', file=sys.stderr)
-        print(f'Re-run with: {WHITE}sudo {sys.argv[0]}{RESET}\n', file=sys.stderr)
-        sys.exit(1)
 
 
 ################################################################################
@@ -370,7 +399,8 @@ def print_help():
     print(f"""{BOLD}RAID Health Monitor{RESET} (v{VERSION})
 
 Usage:
-  sudo {sys.argv[0]} [options]
+  raid [options]           (auto-elevates via sudo)
+  sudo raid [options]
 
 Options:
   -h, --help     Show this help message and exit
@@ -378,7 +408,7 @@ Options:
 
 Description:
   Monitors Linux MDADM software RAID arrays and physical disk SMART attributes.
-  Requires root privileges to query low-level SMART and parted diagnostics.
+  Automatically elevates with sudo when root privileges are required.
 """)
 
 
@@ -390,6 +420,7 @@ def main():
         print_help()
         sys.exit(0)
 
+    check_privileges()
     check_deps()
     print()
 

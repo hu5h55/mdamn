@@ -1,4 +1,4 @@
-# RAID Health Monitor (`raid`) (v15.0.0)
+# RAID Health Monitor (`raid`) (v15.0.1)
 
 A lightweight, real-time command-line health monitor for Linux **MDADM software RAID arrays** and physical drives.
 
