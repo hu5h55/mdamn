@@ -2,10 +2,10 @@
 
 ################################################################################
 # RAID Health Monitor
-# Version: 16.0.0 - Python (Interactive TUI + RAID Actions + Static Mode)
+# Version: 16.0.1 - Python (Interactive TUI + RAID Actions + Static Mode)
 ################################################################################
 
-VERSION = "16.0.0"
+VERSION = "16.0.1"
 
 import os
 import re
@@ -43,6 +43,29 @@ ANSI_RE   = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 def strip_ansi(s):
     return ANSI_RE.sub('', s)
+
+
+def vis_len(s):
+    return len(ANSI_RE.sub('', s))
+
+
+def make_box(indent, title_str, body_lines, target_outer_w=0):
+    """Render a closed rounded box (╭─── title ───╮ ... ╰────╯) with exact right-edge alignment."""
+    title_vlen = vis_len(title_str)
+    max_body   = max((vis_len(ln) for ln in body_lines if ln != 'SEP'), default=0)
+    min_inner  = max(0, target_outer_w - len(indent) - 2)
+    inner_w    = max(min_inner, max_body + 2, title_vlen + 6)
+
+    top_dashes = max(1, inner_w - title_vlen - 5)
+    out = [f'{indent}{DARK_GRAY}╭─── {RESET}{title_str}{DARK_GRAY} {"─" * top_dashes}╮{RESET}']
+    for ln in body_lines:
+        if ln == 'SEP':
+            out.append(f'{indent}{DARK_GRAY}├{"─" * inner_w}┤{RESET}')
+        else:
+            pad = max(0, inner_w - 2 - vis_len(ln))
+            out.append(f'{indent}{DARK_GRAY}│{RESET} {ln}{" " * pad} {DARK_GRAY}│{RESET}')
+    out.append(f'{indent}{DARK_GRAY}╰{"─" * inner_w}╯{RESET}')
+    return out
 
 
 ################################################################################
@@ -787,11 +810,40 @@ def refresh_raid_fast(telemetry):
 # Formatting & Static Rendering
 ################################################################################
 
-def format_raid_lines(r, selected=False, expanded=False):
-    """Return list of formatted lines for a RAID array header."""
-    sel_prefix = f'{BG_SEL}{CYAN}{BOLD}❯ {RESET}{BG_SEL}' if selected else '  '
-    sel_suffix = f'{RESET}' if selected else ''
+def fmt_model(d):
+    m = d['model']
+    return (m[:22] + '..') if len(m) > 23 else m
 
+
+def fmt_serial(d):
+    s = d['smart']['serial']
+    return ('..' + s[-6:]) if len(s) > 6 else s
+
+
+def fmt_poh(d):
+    poh = d['smart']['poh']
+    return (f'{poh // 1000}k' if poh > 1000 else str(poh)) if poh else '0'
+
+
+def fmt_temp(d):
+    t = d['smart']['temp']
+    return f'{t}°C' if t > 0 else 'N/A'
+
+
+def fmt_errs(d):
+    smart = d['smart']
+    errs = []
+    if smart['pend']:    errs.append(f'Pend:{smart["pend"]}')
+    if smart['uncorr']:  errs.append(f'Unc:{smart["uncorr"]}')
+    if smart['realloc']: errs.append(f'Realloc:{smart["realloc"]}')
+    return ' '.join(errs) if errs else '-'
+
+
+def fmt_state(d):
+    return d['state_txt'] if d['state_txt'] else '-'
+
+
+def build_raid_line1_core(r, selected=False):
     state_col = r['state_col']
     su        = r['su']
     md        = r['md']
@@ -799,238 +851,271 @@ def format_raid_lines(r, selected=False, expanded=False):
     active    = r['active']
     total     = r['total']
     usage_str = r['df']['usage_str']
-    mount_str = r['df']['mount_str']
-    sync_str  = r['sync_str']
-    mismatch  = r['mismatch']
+    mount_pt  = r['df']['mount_pt']
 
-    lines = []
     if not r['anomaly']:
-        line1 = (
-            f'{sel_prefix}{state_col}■ {su}{RESET}  {BLUE}{BOLD if selected else ""}{md}{RESET}  '
-            f'{GRAY}{level}{RESET}    {GRAY}{active}/{total} devices{RESET}'
+        core = (
+            f'{state_col}■ {su}{RESET}  {BLUE}{BOLD if selected else ""}{md}{RESET}  '
+            f'{GRAY}{level}{RESET}  {GRAY}{active}/{total} devices{RESET}'
         )
         if usage_str:
-            line1 += f'    {GRAY}Usage:{RESET} {usage_str}'
-        if mount_str:
-            line1 += f'   {mount_str}'
-        if sync_str:
-            line1 += sync_str
-        if selected:
-            line1 += f'  {CYAN}[Enter: Actions]{RESET}'
-        line1 += sel_suffix
-        lines.append(line1)
+            core += f'  {GRAY}Usage:{RESET} {usage_str}'
+        if mount_pt:
+            core += f'  {GRAY}({mount_pt}){RESET}'
     else:
-        line1 = f'{sel_prefix}{state_col}■ {su}{RESET}  {BLUE}{BOLD if selected else ""}{md}{RESET}  {GRAY}{level}{RESET}'
-        if mount_str:
-            line1 += f'    {mount_str}'
-        if selected:
-            line1 += f'  {CYAN}[Enter: Actions]{RESET}'
-        line1 += sel_suffix
-        lines.append(line1)
+        core = f'{state_col}■ {su}{RESET}  {BLUE}{BOLD if selected else ""}{md}{RESET}  {GRAY}{level}{RESET}'
+        if mount_pt:
+            core += f'  {GRAY}({mount_pt}){RESET}'
+    return core
 
+
+def compute_layout(telemetry):
+    """Compute tight column widths and unified row width across RAID and Standalone tables."""
+    all_disks = [d for r in telemetry['raids'] for d in r['disks']] + list(telemetry['standalone'])
+    w_model  = max([len('Model')]  + [len(fmt_model(d))  for d in all_disks])
+    w_dev    = max([len('Device')] + [len(d['dev'])      for d in all_disks])
+    w_serial = max([len('Serial')] + [len(fmt_serial(d)) for d in all_disks])
+    w_size   = max([len('Size')]   + [len(d['size'])     for d in all_disks])
+    w_type   = max([len('Type')]   + [len(d['type'])     for d in all_disks])
+    w_poh    = max([len('POH')]    + [len(fmt_poh(d))    for d in all_disks])
+    w_temp   = max([len('Temp')]   + [len(fmt_temp(d))   for d in all_disks])
+    w_err    = max([len('Errors')] + [len(fmt_errs(d))   for d in all_disks])
+    w_state  = max([len('State')]  + [len(fmt_state(d))  for d in all_disks])
+
+    disk_row_w = (
+        2 + w_model + 2 + w_dev + 2 + w_serial + 2 + w_size + 2 +
+        w_type + 2 + w_poh + 2 + w_temp + 2 + w_err + 2 + w_state
+    )
+
+    raid_row_w = 0
+    for r in telemetry['raids']:
+        core = build_raid_line1_core(r, selected=False)
+        raid_row_w = max(raid_row_w, 2 + vis_len(core))
+
+    row_w = max(disk_row_w, raid_row_w)
+    return {
+        'w_model':    w_model,
+        'w_dev':      w_dev,
+        'w_serial':   w_serial,
+        'w_size':     w_size,
+        'w_type':     w_type,
+        'w_poh':      w_poh,
+        'w_temp':     w_temp,
+        'w_err':      w_err,
+        'w_state':    w_state,
+        'disk_row_w': disk_row_w,
+        'row_w':      row_w,
+    }
+
+
+def format_raid_lines(r, layout, selected=False, interactive=True):
+    """Return list of formatted lines for a RAID array header."""
+    prefix = (f'{BG_SEL}{CYAN}{BOLD}❯ {RESET}{BG_SEL}' if selected else '  ') if interactive else ''
+    core   = build_raid_line1_core(r, selected=selected)
+    row_w  = layout['row_w'] if interactive else (vis_len(core))
+    cur_w  = (2 if interactive else 0) + vis_len(core)
+    pad    = ' ' * max(0, row_w - cur_w)
+
+    if selected:
+        core_bg = core.replace(RESET, RESET + BG_SEL)
+        line1   = f'{prefix}{core_bg}{pad}{RESET}  {CYAN}[Enter: Actions]{RESET}'
+    else:
+        line1   = f'{prefix}{core}{pad}'
+
+    lines = [line1]
+    indent_sub = '    ' if interactive else '  '
+
+    if r['anomaly']:
+        mismatch  = r['mismatch']
+        active    = r['active']
+        total     = r['total']
+        usage_str = r['df']['usage_str']
         detail = (
-            f'    {YELLOW}!{RESET}    '
-            f'{GRAY}Mismatch: {RED if mismatch else GREEN}{mismatch}{RESET}    '
+            f'{indent_sub}{YELLOW}!{RESET}  '
+            f'{GRAY}Mismatch: {RED if mismatch else GREEN}{mismatch}{RESET}  '
             f'{GRAY}Active: {WHITE}{active}/{total}{RESET}'
         )
         if usage_str:
-            detail += f'    {GRAY}Usage:{RESET} {usage_str}'
-        if sync_str:
-            detail += sync_str
+            detail += f'  {GRAY}Usage:{RESET} {usage_str}'
         lines.append(detail)
+
+    if r['sync_str']:
+        lines.append(f'{indent_sub}{DARK_GRAY}╰─{RESET} {r["sync_str"].strip()}')
 
     return lines
 
 
-def format_disk_header(indent='  '):
+def format_disk_header(layout, indent='  '):
     return (
-        f'{indent}{BOLD}{WHITE}{"Model":<24} {"Device":<10} {"Serial":<10} {"Size":<8} '
-        f'{"Type":<6} {"POH":<6} {"Temp":<8} {"Errors":<18} State{RESET}'
+        f'{indent}{BOLD}{WHITE}'
+        f'{"Model":<{layout["w_model"]}}  '
+        f'{"Device":<{layout["w_dev"]}}  '
+        f'{"Serial":<{layout["w_serial"]}}  '
+        f'{"Size":<{layout["w_size"]}}  '
+        f'{"Type":<{layout["w_type"]}}  '
+        f'{"POH":<{layout["w_poh"]}}  '
+        f'{"Temp":<{layout["w_temp"]}}  '
+        f'{"Errors":<{layout["w_err"]}}  '
+        f'{"State":<{layout["w_state"]}}'
+        f'{RESET}'
     )
 
 
-def format_disk_row(d, selected=False, expanded=False, interactive=False):
-    smart = d['smart']
+def format_disk_row(d, layout, selected=False, expanded=False, interactive=False):
+    smart      = d['smart']
+    model      = fmt_model(d)
+    serial_fmt = fmt_serial(d)
+    poh        = smart['poh']
+    poh_col    = RED if poh > 50000 else YELLOW if poh > 30000 else GREEN if poh else GRAY
+    poh_fmt    = fmt_poh(d)
 
-    model = d['model']
-    if len(model) > 23:
-        model = model[:22] + '..'
+    temp       = smart['temp']
+    temp_col   = RED if temp >= 50 else YELLOW if temp >= 40 else GREEN if temp > 0 else GRAY
+    temp_out   = fmt_temp(d)
 
-    serial     = smart['serial']
-    serial_fmt = ('..' + serial[-6:]) if len(serial) > 6 else serial
+    err_str    = fmt_errs(d)
+    err_col    = RED if err_str != '-' else GRAY
 
-    poh     = smart['poh']
-    poh_col = RED if poh > 50000 else YELLOW if poh > 30000 else GREEN if poh else GRAY
-    poh_fmt = (f'{poh // 1000}k' if poh > 1000 else str(poh)) if poh else '0'
+    type_col   = CYAN if d['type'] == 'SSD' else YELLOW
 
-    temp     = smart['temp']
-    temp_col = RED if temp >= 50 else YELLOW if temp >= 40 else GREEN if temp > 0 else GRAY
-    temp_out = f'{temp}°C' if temp > 0 else 'N/A'
-
-    errs = []
-    if smart['pend']:    errs.append(f'Pend:{smart["pend"]}')
-    if smart['uncorr']:  errs.append(f'Unc:{smart["uncorr"]}')
-    if smart['realloc']: errs.append(f'Realloc:{smart["realloc"]}')
-    err_str = ' '.join(errs) if errs else '-'
-    err_col = RED if errs else GRAY
-
-    type_col = CYAN if d['type'] == 'SSD' else YELLOW
-
-    state_txt = d['state_txt']
+    state_txt  = fmt_state(d)
     if   re.search(r'faulty|fail',           state_txt): state_col = RED
     elif re.search(r'spare',                  state_txt): state_col = BLUE
     elif re.search(r'rebuild|recover|resync', state_txt): state_col = YELLOW
     else:                                                 state_col = GRAY
 
-    model_col = RED if RED in (poh_col, temp_col, err_col, state_col) else WHITE
+    model_col  = RED if RED in (poh_col, temp_col, err_col, state_col) else WHITE
 
     if not interactive:
         prefix = '  '
     else:
-        arrow = '▾' if expanded else ('❯' if selected else ' ')
-        prefix = f'{CYAN}{BOLD}{arrow}{RESET} ' if (selected or expanded) else '  '
+        arrow  = '▾' if expanded else ('❯' if selected else ' ')
+        prefix = f'{BG_SEL if selected else ""}{CYAN}{BOLD}{arrow}{RESET}{BG_SEL if selected else ""} ' if (selected or expanded) else '  '
 
     bg = BG_SEL if selected else ''
-    hint = f' {CYAN}{"[Enter: Collapse]" if expanded else "[Enter: Details]"}{RESET}' if selected else ''
-
-    return (
-        f'{prefix}{bg}'
-        f'{model_col}{BOLD if selected else ""}{model:<24}{RESET}{bg} '
-        f'{CYAN}{d["dev"]:<10}{RESET}{bg} '
-        f'{GRAY}{serial_fmt:<10}{RESET}{bg} '
-        f'{WHITE}{d["size"]:<8}{RESET}{bg} '
-        f'{type_col}{d["type"]:<6}{RESET}{bg} '
-        f'{poh_col}{poh_fmt:<6}{RESET}{bg} '
-        f'{temp_col}{temp_out:<8}{RESET}{bg} '
-        f'{err_col}{err_str:<18}{RESET}{bg} '
-        f'{state_col}{state_txt}{RESET}'
-        f'{hint}'
+    core = (
+        f'{model_col}{BOLD if selected else ""}{model:<{layout["w_model"]}}{RESET}{bg}  '
+        f'{CYAN}{d["dev"]:<{layout["w_dev"]}}{RESET}{bg}  '
+        f'{GRAY}{serial_fmt:<{layout["w_serial"]}}{RESET}{bg}  '
+        f'{WHITE}{d["size"]:<{layout["w_size"]}}{RESET}{bg}  '
+        f'{type_col}{d["type"]:<{layout["w_type"]}}{RESET}{bg}  '
+        f'{poh_col}{poh_fmt:<{layout["w_poh"]}}{RESET}{bg}  '
+        f'{temp_col}{temp_out:<{layout["w_temp"]}}{RESET}{bg}  '
+        f'{err_col}{err_str:<{layout["w_err"]}}{RESET}{bg}  '
+        f'{state_col}{state_txt:<{layout["w_state"]}}{RESET}{bg}'
     )
 
+    cur_w = 2 + layout['disk_row_w'] - 2
+    pad   = (' ' * max(0, layout['row_w'] - cur_w)) if interactive else ''
+    hint  = f'  {CYAN}{"[Enter: Collapse]" if expanded else "[Enter: Details]"}{RESET}' if selected else ''
 
-def format_disk_expanded(d):
-    """Render an inline expanded box with full SMART and hardware details for a drive."""
-    smart = d['smart']
-    poh   = smart['poh']
-    years = poh // 8760
-    days  = (poh % 8760) // 24
-    poh_detail = f"{poh:,} hrs ({years}y {days}d)" if poh else "0 hrs"
+    return f'{prefix}{bg}{core}{pad}{RESET if selected else ""}{hint}'
+
+
+def format_disk_expanded(d, layout):
+    """Render a closed inline rounded box with full SMART and hardware details for a drive."""
+    smart      = d['smart']
+    poh        = smart['poh']
+    years      = poh // 8760
+    days       = (poh % 8760) // 24
+    poh_detail = f"{poh:,}h ({years}y {days}d)" if poh else "0h"
 
     health_col = GREEN if 'PASS' in smart['health'].upper() or 'OK' in smart['health'].upper() else (
         RED if 'FAIL' in smart['health'].upper() else YELLOW
     )
 
-    lines = []
-    lines.append(f'    {DARK_GRAY}╭─── {CYAN}{BOLD}{d["dev"]}{RESET} {GRAY}({d["model"]}){DARK_GRAY} ' + '─' * max(10, 68 - len(d['dev']) - len(d['model'])) + f'{RESET}')
-    lines.append(
-        f'    {DARK_GRAY}│{RESET} {GRAY}Serial:{RESET} {WHITE}{smart["serial"]:<20}{RESET} '
-        f'{GRAY}Firmware:{RESET} {WHITE}{smart["firmware"]:<12}{RESET} '
-        f'{GRAY}SMART Health:{RESET} {health_col}{BOLD}{smart["health"]}{RESET}'
-    )
-    lines.append(
-        f'    {DARK_GRAY}│{RESET} {GRAY}Media:{RESET}  {WHITE}{smart["rotation"]:<20}{RESET} '
-        f'{GRAY}Form:{RESET}     {WHITE}{smart["form_factor"]:<12}{RESET} '
-        f'{GRAY}Interface:{RESET}    {WHITE}{smart["sata_ver"]}{RESET}'
-    )
-    lines.append(
-        f'    {DARK_GRAY}│{RESET} {GRAY}Power:{RESET}  {WHITE}{poh_detail:<20}{RESET} '
-        f'{GRAY}Cycles:{RESET}   {WHITE}{smart["power_cycles"]:<12}{RESET} '
-        f'{GRAY}Load Cycles:{RESET}  {WHITE}{smart["load_cycles"]} (Start/Stop: {smart["start_stop"]}){RESET}'
-    )
+    sata_compact = re.sub(r'\s*\(current:.*?\)', '', smart['sata_ver']).strip()
+    if len(sata_compact) > 20:
+        sata_compact = sata_compact[:20]
+
+    title = f'{CYAN}{BOLD}{d["dev"]}{RESET} {GRAY}({d["model"]}){RESET}'
+    body  = [
+        (
+            f'{GRAY}Serial:{RESET} {WHITE}{smart["serial"][:18]:<18}{RESET}  '
+            f'{GRAY}Firmware:{RESET} {WHITE}{smart["firmware"][:10]:<10}{RESET}  '
+            f'{GRAY}Health:{RESET}    {health_col}{BOLD}{smart["health"]}{RESET}'
+        ),
+        (
+            f'{GRAY}Media:{RESET}  {WHITE}{smart["rotation"][:18]:<18}{RESET}  '
+            f'{GRAY}Form:{RESET}     {WHITE}{smart["form_factor"][:10]:<10}{RESET}  '
+            f'{GRAY}Interface:{RESET} {WHITE}{sata_compact}{RESET}'
+        ),
+        (
+            f'{GRAY}Power:{RESET}  {WHITE}{poh_detail[:18]:<18}{RESET}  '
+            f'{GRAY}Cycles:{RESET}   {WHITE}{str(smart["power_cycles"])[:10]:<10}{RESET}  '
+            f'{GRAY}Load/Stop:{RESET} {WHITE}{smart["load_cycles"]} / {smart["start_stop"]}{RESET}'
+        ),
+    ]
 
     if d['raid_md']:
-        lines.append(
-            f'    {DARK_GRAY}│{RESET} {GRAY}RAID:{RESET}   {BLUE}{d["raid_md"]}{RESET} '
-            f'({CYAN}{d["member_dev"]}{RESET}, Slot {WHITE}{d["slot"]}{RESET}, '
-            f'Kernel State: {GREEN if "sync" in d["md_state"] else YELLOW}{d["md_state"] or d["state_txt"]}{RESET}, '
-            f'MD Read Errors: {RED if d["md_errors"] != "0" else GREEN}{d["md_errors"]}{RESET})'
+        body.append(
+            f'{GRAY}RAID:{RESET}   {BLUE}{d["raid_md"]}{RESET} '
+            f'({CYAN}{d["member_dev"]}{RESET} · Slot {WHITE}{d["slot"]}{RESET} · '
+            f'State: {GREEN if "sync" in d["md_state"] else YELLOW}{d["md_state"] or d["state_txt"]}{RESET} · '
+            f'Errors: {RED if d["md_errors"] != "0" else GREEN}{d["md_errors"]}{RESET})'
         )
     elif d.get('lsblk', {}).get('children'):
         parts = []
         for ch in d['lsblk'].get('children', []):
-            mp = ch.get('mountpoint') or ch.get('fstype') or ''
-            parts.append(f"/dev/{ch.get('name')} ({ch.get('size')}{', ' + mp if mp else ''})")
+            mp = ch.get('mountpoint')
+            if not mp and ch.get('children'):
+                sub_mps = [c.get('mountpoint') for c in ch.get('children', []) if c.get('mountpoint')]
+                if sub_mps:
+                    mp = ','.join(sub_mps)
+            mp = mp or ch.get('fstype') or ''
+            parts.append(f"{ch.get('name')} ({ch.get('size')}{' ' + mp if mp else ''})")
         if parts:
-            lines.append(f'    {DARK_GRAY}│{RESET} {GRAY}Mounts:{RESET} {WHITE}{" · ".join(parts)}{RESET}')
+            mounts_str = ' · '.join(parts)
+            if len(mounts_str) > 70:
+                mounts_str = mounts_str[:68] + '..'
+            body.append(f'{GRAY}Mounts:{RESET} {WHITE}{mounts_str}{RESET}')
 
     # Critical SMART attributes table
     key_ids = {1, 5, 7, 9, 10, 12, 187, 188, 192, 193, 194, 196, 197, 198, 199, 200, 202, 231, 233}
     shown_attrs = [a for a in smart['attrs'] if a['id'] in key_ids or a['raw_int'] > 0][:10]
     if shown_attrs:
-        lines.append(f'    {DARK_GRAY}│{RESET}')
-        lines.append(
-            f'    {DARK_GRAY}│{RESET} {BOLD}{GRAY}{"ID":<4} {"SMART Attribute":<28} '
-            f'{"Val":<5} {"Wrst":<5} {"Thr":<5} {"Raw Value"}{RESET}'
+        body.append('SEP')
+        body.append(
+            f'{BOLD}{GRAY}{"ID":<4}  {"SMART Attribute":<26}  '
+            f'{"Val":<4}  {"Wrst":<4}  {"Thr":<4}  {"Raw Value"}{RESET}'
         )
         for a in shown_attrs:
             is_err_attr = a['id'] in (5, 187, 188, 196, 197, 198, 199) and a['raw_int'] > 0
-            row_col = RED if is_err_attr else WHITE
-            lines.append(
-                f'    {DARK_GRAY}│{RESET} {GRAY}{a["id"]:<4}{RESET} '
-                f'{row_col}{a["name"]:<28}{RESET} '
-                f'{GRAY}{a["value"]:<5} {a["worst"]:<5} {a["thresh"]:<5}{RESET} '
-                f'{row_col}{a["raw"]}{RESET}'
+            row_col  = RED if is_err_attr else WHITE
+            raw_disp = a['raw'][:24]
+            body.append(
+                f'{GRAY}{a["id"]:<4}{RESET}  '
+                f'{row_col}{a["name"][:26]:<26}{RESET}  '
+                f'{GRAY}{a["value"]:<4}  {a["worst"]:<4}  {a["thresh"]:<4}{RESET}  '
+                f'{row_col}{raw_disp}{RESET}'
             )
 
     if smart['selftests']:
-        lines.append(f'    {DARK_GRAY}│{RESET} {GRAY}Last Self-Test:{RESET} {WHITE}{smart["selftests"][0]}{RESET}')
+        st_compact = re.sub(r'\s{2,}', ' · ', smart['selftests'][0].lstrip('#').strip())
+        body.append('SEP')
+        body.append(f'{GRAY}Self-Test:{RESET} #{WHITE}{st_compact[:66]}{RESET}')
 
-    lines.append(f'    {DARK_GRAY}╰' + '─' * 82 + f'{RESET}')
-    return lines
+    return make_box('  ', title, body, target_outer_w=layout['row_w'])
 
 
 def render_static(telemetry):
     """Print the classic static RAID & Disk report (used by --static and non-TTY callers)."""
+    layout = compute_layout(telemetry)
     print()
     for r in telemetry['raids']:
-        # In static mode, use clean 2-space indent so output matches v15 layout
-        state_col = r['state_col']
-        su        = r['su']
-        md        = r['md']
-        level     = r['level']
-        active    = r['active']
-        total     = r['total']
-        usage_str = r['df']['usage_str']
-        mount_str = r['df']['mount_str']
-        sync_str  = r['sync_str']
-        mismatch  = r['mismatch']
-
-        if not r['anomaly']:
-            line1 = f'{state_col}■ {su}{RESET}  {BLUE}{md}{RESET}  {GRAY}{level}{RESET}    {GRAY}{active}/{total} devices{RESET}'
-            if usage_str:
-                line1 += f'    {GRAY}Usage:{RESET} {usage_str}'
-            if mount_str:
-                line1 += f'    {mount_str}'
-            if sync_str:
-                line1 += sync_str
-            print(line1)
-        else:
-            line1 = f'{state_col}■ {su}{RESET}  {BLUE}{md}{RESET}  {GRAY}{level}{RESET}'
-            if mount_str:
-                line1 += f'    {mount_str}'
-            print(line1)
-            detail = (
-                f'  {YELLOW}!{RESET}    '
-                f'{GRAY}Mismatch: {RED if mismatch else GREEN}{mismatch}{RESET}    '
-                f'{GRAY}Active: {WHITE}{active}/{total}{RESET}'
-            )
-            if usage_str:
-                detail += f'    {GRAY}Usage:{RESET} {usage_str}'
-            if sync_str:
-                detail += sync_str
-            print(detail)
-
+        for ln in format_raid_lines(r, layout, selected=False, interactive=False):
+            print(ln)
         if r['disks']:
-            print(format_disk_header('  '))
+            print(format_disk_header(layout, '  '))
             for d in r['disks']:
-                print(format_disk_row(d, interactive=False))
+                print(format_disk_row(d, layout, interactive=False))
         print()
 
     if telemetry['standalone']:
         print(f'{MAGENTA}■ Standalone Disks{RESET}')
-        print(format_disk_header('  '))
+        print(format_disk_header(layout, '  '))
         for d in telemetry['standalone']:
-            print(format_disk_row(d, interactive=False))
+            print(format_disk_row(d, layout, interactive=False))
         print()
 
     print(f'{GRAY}Last updated: {telemetry["updated_at"]}{RESET}\n')
@@ -1094,107 +1179,110 @@ def build_raid_menu_options(r, show_raw_detail=False):
 
     opts = []
     if action in ('check', 'repair', 'resync'):
-        opts.append(('pause', f"⏸  Pause {action.upper()} (save progress at {pct:.1f}% / sector {tel['cur_sectors']:,})"))
+        opts.append(('pause', f"[p] Pause {action.upper()} (save progress at {pct:.1f}% / sector {tel['cur_sectors']:,})"))
     else:
-        opts.append(('pause', f"{GRAY}⏸  Pause Check (currently idle){RESET}"))
+        opts.append(('pause', f"{GRAY}[p] Pause Check (currently idle){RESET}"))
 
     if is_paused:
-        opts.append(('resume', f"▶  Resume Check from {pct:.1f}% (sector {tel['sync_min']:,})"))
+        opts.append(('resume', f"[r] Resume Check from {pct:.1f}% (sector {tel['sync_min']:,})"))
     elif action == 'idle':
-        opts.append(('resume', "▶  Start / Resume Check"))
+        opts.append(('resume', "[r] Start / Resume Check"))
     else:
-        opts.append(('resume', f"{GRAY}▶  Resume Check (already running){RESET}"))
+        opts.append(('resume', f"{GRAY}[r] Resume Check (already running){RESET}"))
 
-    opts.append(('full_check', "↻  Start Full Check from 0.0% (reset saved progress)"))
+    opts.append(('full_check', "[f] Start Full Check from 0.0% (reset saved progress)"))
 
     if is_paused or action != 'idle':
-        opts.append(('stop_reset', "⏹  Stop & Reset Check (set idle & clear saved sector)"))
+        opts.append(('stop_reset', "[x] Stop & Reset Check (set idle & clear saved sector)"))
 
-    opts.append(('repair',     "🛠  Start Parity Repair Scrub (repair mismatches)"))
-    opts.append(('spd_quiet',  "🔉 Speed Profile: Quiet / Background (max 50 MB/s)"))
-    opts.append(('spd_normal', "⚡ Speed Profile: System Default (max 200 MB/s)"))
-    opts.append(('spd_turbo',  "🚀 Speed Profile: Turbo / Unthrottled (max 1,000 MB/s)"))
-    opts.append(('toggle_raw', f"📋 {'Hide' if show_raw_detail else 'Show'} Full mdadm --detail Output"))
-    opts.append(('back',       "↩  Back to Main View (Esc)"))
+    opts.append(('repair',     "[m] Start Parity Repair Scrub (repair mismatches)"))
+    opts.append(('spd_quiet',  "[1] Speed Profile: Quiet / Background (max 50 MB/s)"))
+    opts.append(('spd_normal', "[2] Speed Profile: System Default (max 200 MB/s)"))
+    opts.append(('spd_turbo',  "[3] Speed Profile: Turbo / Unthrottled (max 1,000 MB/s)"))
+    opts.append(('toggle_raw', f"[d] {'Hide' if show_raw_detail else 'Show'} Full mdadm --detail Output"))
+    opts.append(('back',       "[q] Back to Main View (Esc)"))
     return opts
 
 
-def render_raid_modal(r, menu_idx, show_raw_detail=False, confirm_full=False, status_msg=None):
+def render_raid_modal(r, layout, menu_idx, show_raw_detail=False, confirm_full=False, status_msg=None):
     tel    = r['sync_tel']
-    lines  = []
     md     = r['md']
     su     = r['su']
     st_col = r['state_col']
 
-    lines.append(f'  {DARK_GRAY}╭─── {BLUE}{BOLD}RAID Array Control & Telemetry: {md}{RESET} {DARK_GRAY}' + '─' * max(10, 48 - len(md)) + f'{RESET}')
-    lines.append(
-        f'  {DARK_GRAY}│{RESET} {GRAY}State:{RESET}      {st_col}■ {BOLD}{su}{RESET} ({r["state_raw"]})    '
-        f'{GRAY}Level:{RESET} {WHITE}{r["level"]}{RESET}    '
-        f'{GRAY}Size:{RESET} {WHITE}{r["size"]}{RESET}    '
-        f'{GRAY}Chunk:{RESET} {WHITE}{r["chunk_size"] or "N/A"}{RESET}'
-    )
-    lines.append(
-        f'  {DARK_GRAY}│{RESET} {GRAY}Devices:{RESET}    {WHITE}{r["active"]}/{r["total"]} active{RESET} '
-        f'(Working: {r["working"]}, Failed: {RED if r["failed"] != "0" else GREEN}{r["failed"]}{RESET}, Spare: {r["spare"]})    '
-        f'{GRAY}Mismatches:{RESET} {RED if r["mismatch"] else GREEN}{r["mismatch"]}{RESET}'
-    )
-    lines.append(
-        f'  {DARK_GRAY}│{RESET} {GRAY}UUID:{RESET}       {WHITE}{r["uuid"]}{RESET}    '
-        f'{GRAY}Layout:{RESET} {WHITE}{r["layout"] or "N/A"}{RESET}    '
-        f'{GRAY}Events:{RESET} {WHITE}{r["events"]}{RESET}'
-    )
+    title = f'{BLUE}{BOLD}RAID Array Control & Telemetry: {md}{RESET}'
+    body  = [
+        (
+            f'{GRAY}State:{RESET}   {st_col}■ {BOLD}{su}{RESET} ({r["state_raw"]})   '
+            f'{GRAY}Level:{RESET} {WHITE}{r["level"]}{RESET}   '
+            f'{GRAY}Size:{RESET} {WHITE}{r["size"]}{RESET}   '
+            f'{GRAY}Chunk:{RESET} {WHITE}{r["chunk_size"] or "N/A"}{RESET}'
+        ),
+        (
+            f'{GRAY}Devices:{RESET} {WHITE}{r["active"]}/{r["total"]} active{RESET} '
+            f'(Working: {r["working"]}, Failed: {RED if r["failed"] != "0" else GREEN}{r["failed"]}{RESET}, Spare: {r["spare"]})   '
+            f'{GRAY}Mismatches:{RESET} {RED if r["mismatch"] else GREEN}{r["mismatch"]}{RESET}'
+        ),
+        (
+            f'{GRAY}UUID:{RESET}   {WHITE}{r["uuid"]}{RESET}  '
+            f'{GRAY}Layout:{RESET} {WHITE}{r["layout"] or "N/A"}{RESET}  '
+            f'{GRAY}Events:{RESET} {WHITE}{r["events"]}{RESET}'
+        ),
+        'SEP',
+    ]
 
-    # Sync / Scrub progress bar & sector offset details
     bar_col = CYAN if tel['sync_action'] == 'check' else (YELLOW if tel['is_paused'] else GREEN)
     spd_str = f"{tel['sync_speed_kb'] / 1024:.1f} MB/s" if tel['sync_speed_kb'] > 0 else "0.0 MB/s"
     eta_str = format_eta(tel['mdstat_finish']) if tel['mdstat_finish'] else (
         "Paused" if tel['is_paused'] else "Idle"
     )
-    lines.append(f'  {DARK_GRAY}│{RESET}')
-    lines.append(
-        f'  {DARK_GRAY}│{RESET} {GRAY}Scrub/Sync:{RESET} {usage_bar(tel["pct"], 20, bar_col)} '
+    try:
+        max_mb = f"{int(tel['speed_max_raw']) // 1000} MB/s"
+    except ValueError:
+        max_mb = f"{tel['speed_max_raw']} KB/s"
+    body.append(
+        f'{GRAY}Scrub:{RESET}   {usage_bar(tel["pct"], 14, bar_col)} '
         f'{BOLD}{WHITE}{tel["pct"]:.2f}%{RESET}  '
         f'{GRAY}Action:{RESET} {CYAN}{tel["sync_action"]}{RESET}  '
         f'{GRAY}Speed:{RESET} {WHITE}{spd_str}{RESET}  '
         f'{GRAY}Status:{RESET} {YELLOW if tel["is_paused"] else WHITE}{eta_str}{RESET}'
     )
-    lines.append(
-        f'  {DARK_GRAY}│{RESET} {GRAY}Sectors:{RESET}    {WHITE}{tel["cur_sectors"]:,}{RESET} / {GRAY}{tel["total_sectors"]:,}{RESET} '
-        f'({GRAY}Saved sync_min:{RESET} {YELLOW if tel["sync_min"] > 0 else GRAY}{tel["sync_min"]:,}{RESET})  '
-        f'{GRAY}Limits:{RESET} {WHITE}{tel["speed_min_raw"]} .. {tel["speed_max_raw"]} KB/s{RESET}'
+    body.append(
+        f'{GRAY}Sectors:{RESET} {WHITE}{tel["cur_sectors"]:,}{RESET} / {GRAY}{tel["total_sectors"]:,}{RESET} '
+        f'({GRAY}saved:{RESET} {YELLOW if tel["sync_min"] > 0 else GRAY}{tel["sync_min"]:,}{RESET})  '
+        f'{GRAY}Limit:{RESET} {WHITE}{max_mb}{RESET}'
     )
 
     if status_msg:
         ok, msg = status_msg
         col = GREEN if ok else RED
-        lines.append(f'  {DARK_GRAY}│{RESET}')
-        lines.append(f'  {DARK_GRAY}│{RESET} {col}{BOLD}➔ {msg}{RESET}')
+        body.append('SEP')
+        body.append(f'{col}{BOLD}➔ {msg}{RESET}')
 
+    body.append('SEP')
     if confirm_full:
-        lines.append(f'  {DARK_GRAY}│{RESET}')
-        lines.append(
-            f'  {DARK_GRAY}│{RESET} {YELLOW}{BOLD}⚠ Confirm resetting scrub progress ({tel["pct"]:.1f}%) back to 0.0%? '
-            f'Press [y] to confirm or [n/Esc] to cancel.{RESET}'
+        body.append(
+            f'{YELLOW}{BOLD}! Confirm resetting scrub progress ({tel["pct"]:.1f}%) back to 0.0%? '
+            f'[y] Confirm / [n] Cancel{RESET}'
         )
     else:
-        lines.append(f'  {DARK_GRAY}│{RESET}')
-        lines.append(f'  {DARK_GRAY}│{RESET} {BOLD}{WHITE}Select Action (↑/↓ to move, Enter to run, Esc to close):{RESET}')
+        body.append(f'{BOLD}{WHITE}Select Action (↑/↓ or hotkey, Enter to run, Esc to close):{RESET}')
         opts = build_raid_menu_options(r, show_raw_detail)
         for idx, (_, label) in enumerate(opts):
             if idx == menu_idx:
-                lines.append(f'  {DARK_GRAY}│{RESET}   {BG_SEL}{CYAN}{BOLD}❯ {label} {RESET}')
+                lbl_bg = label.replace(RESET, RESET + BG_SEL)
+                body.append(f'  {BG_SEL}{CYAN}{BOLD}❯ {lbl_bg} {RESET}')
             else:
-                lines.append(f'  {DARK_GRAY}│{RESET}     {WHITE}{label}{RESET}')
+                body.append(f'    {WHITE}{label}{RESET}')
 
     if show_raw_detail:
-        lines.append(f'  {DARK_GRAY}│{RESET}')
-        lines.append(f'  {DARK_GRAY}│{RESET} {BOLD}{CYAN}─── Raw mdadm --detail {md} ───{RESET}')
+        body.append('SEP')
+        body.append(f'{BOLD}{CYAN}Raw mdadm --detail {md}:{RESET}')
         for raw_ln in r['md_info'].splitlines():
             if raw_ln.strip():
-                lines.append(f'  {DARK_GRAY}│{RESET}   {GRAY}{raw_ln}{RESET}')
+                body.append(f'  {GRAY}{raw_ln.strip()[:76]}{RESET}')
 
-    lines.append(f'  {DARK_GRAY}╰' + '─' * 84 + f'{RESET}')
-    return lines
+    return make_box('  ', title, body, target_outer_w=layout['row_w'])
 
 
 def run_interactive(telemetry):
@@ -1244,29 +1332,31 @@ def run_interactive(telemetry):
             cursor_idx = max(0, min(cursor_idx, len(items) - 1))
             sel_type, sel_id, sel_obj = items[cursor_idx]
 
+            layout = compute_layout(telemetry)
             term_cols, term_rows = shutil.get_terminal_size((100, 35))
             lines = []
             selected_line_idx = 0
 
             # Title Bar
             lines.append(
-                f'  {BOLD}{WHITE}RAID Health Monitor{RESET} {GRAY}v{VERSION}{RESET}    '
-                f'{DARK_GRAY}│{RESET} {GRAY}↑/↓: Select   Enter: Actions / Details   '
-                f'a: Expand All   r: Refresh   q: Quit{RESET}'
+                f'  {BOLD}{WHITE}RAID Health Monitor{RESET} {GRAY}v{VERSION}{RESET}  '
+                f'{DARK_GRAY}│{RESET} {GRAY}↑/↓: Select  Enter: Actions/Details  '
+                f'a: Expand All  r: Refresh  q: Quit{RESET}'
             )
-            lines.append(f'  {DARK_GRAY}' + '─' * min(term_cols - 4, 96) + f'{RESET}')
+            lines.append(f'  {DARK_GRAY}' + '─' * max(10, layout['row_w'] - 2) + f'{RESET}')
 
             for r in telemetry['raids']:
                 is_raid_sel = (sel_type == 'raid' and sel_id == r['md'] and active_raid_md is None)
                 if is_raid_sel or active_raid_md == r['md']:
                     selected_line_idx = len(lines)
 
-                lines.extend(format_raid_lines(r, selected=is_raid_sel))
+                lines.extend(format_raid_lines(r, layout, selected=is_raid_sel, interactive=True))
 
                 if active_raid_md == r['md']:
                     lines.extend(
                         render_raid_modal(
                             r,
+                            layout,
                             raid_menu_idx,
                             show_raw_detail=show_raw_detail,
                             confirm_full=confirm_full,
@@ -1275,28 +1365,28 @@ def run_interactive(telemetry):
                     )
 
                 if r['disks']:
-                    lines.append(format_disk_header('  '))
+                    lines.append(format_disk_header(layout, '  '))
                     for d in r['disks']:
                         is_d_sel = (sel_type == 'disk' and sel_id == d['dev'] and active_raid_md is None)
                         is_d_exp = (d['dev'] in expanded_disks)
                         if is_d_sel:
                             selected_line_idx = len(lines)
-                        lines.append(format_disk_row(d, selected=is_d_sel, expanded=is_d_exp, interactive=True))
+                        lines.append(format_disk_row(d, layout, selected=is_d_sel, expanded=is_d_exp, interactive=True))
                         if is_d_exp:
-                            lines.extend(format_disk_expanded(d))
+                            lines.extend(format_disk_expanded(d, layout))
                 lines.append('')
 
             if telemetry['standalone']:
                 lines.append(f'  {MAGENTA}■ Standalone Disks{RESET}')
-                lines.append(format_disk_header('  '))
+                lines.append(format_disk_header(layout, '  '))
                 for d in telemetry['standalone']:
                     is_d_sel = (sel_type == 'disk' and sel_id == d['dev'] and active_raid_md is None)
                     is_d_exp = (d['dev'] in expanded_disks)
                     if is_d_sel:
                         selected_line_idx = len(lines)
-                    lines.append(format_disk_row(d, selected=is_d_sel, expanded=is_d_exp, interactive=True))
+                    lines.append(format_disk_row(d, layout, selected=is_d_sel, expanded=is_d_exp, interactive=True))
                     if is_d_exp:
-                        lines.extend(format_disk_expanded(d))
+                        lines.extend(format_disk_expanded(d, layout))
                 lines.append('')
 
             if status_msg and active_raid_md is None:
@@ -1350,6 +1440,17 @@ def run_interactive(telemetry):
                     continue
 
                 opts = build_raid_menu_options(r_obj, show_raw_detail)
+                hotkey_map = {
+                    'p': 'pause',
+                    'r': 'resume',
+                    'f': 'full_check',
+                    'x': 'stop_reset',
+                    'm': 'repair',
+                    '1': 'spd_quiet',
+                    '2': 'spd_normal',
+                    '3': 'spd_turbo',
+                    'd': 'toggle_raw',
+                }
                 if key in ('UP', 'k'):
                     raid_menu_idx = (raid_menu_idx - 1) % len(opts)
                 elif key in ('DOWN', 'j'):
@@ -1358,8 +1459,8 @@ def run_interactive(telemetry):
                     active_raid_md  = None
                     confirm_full    = False
                     show_raw_detail = False
-                elif key in ('ENTER', 'SPACE'):
-                    act_key = opts[raid_menu_idx][0]
+                elif key in ('ENTER', 'SPACE') or key in hotkey_map:
+                    act_key = hotkey_map[key] if key in hotkey_map else opts[raid_menu_idx][0]
                     if act_key == 'pause':
                         status_msg = action_pause_check(active_raid_md)
                         refresh_raid_fast(telemetry)

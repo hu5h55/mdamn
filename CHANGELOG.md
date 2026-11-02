@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [16.0.1] - 2026-11-02
+
+### Improved & Fixed
+- **Tight Dynamic Column Layout (`compute_layout`)**:
+  - Replaced loose hardcoded column widths (`<24`, `<10`, `<18` for `Errors`, etc.) with exact dynamic column widths computed across all RAID member drives and standalone drives with a strict 2-space column gutter.
+- **Unified X-Coordinate Alignment for Selection Hints**:
+  - Padded `State` consistently across RAID member disks (`active sync`) and standalone disks (`-`) and unified `row_w` across RAID headers, RAID disks, and standalone disks so `[Enter: Actions]`, `[Enter: Details]`, and `[Enter: Collapse]` (as well as the full-row selection highlight `BG_SEL`) align on the exact same X column.
+  - Moved active/paused scrub progress onto a dedicated indented sub-line (`╰─ Scrub: ...`) so the RAID header line maintains fixed column alignment regardless of scrub state.
+- **Closed Square-ish Rounded Box Borders (`make_box`)**:
+  - Added `make_box` using ANSI-stripped visual width calculation (`vis_len`) to render closed rounded boxes (`╭─── ... ───╮`, `│ ... │`, `├────┤`, `╰────╯`) whose right-hand border closes cleanly and aligns flush with the table right edge (`row_w`).
+  - Replaced variable-width emojis in the RAID Control Modal with fixed 1-cell `[p]`, `[r]`, `[f]`, `[x]`, `[m]`, `[1]`, `[2]`, `[3]`, `[d]`, `[q]` labels and added direct keyboard hotkey support inside the modal.
+  - Added recursive `lsblk` child mount resolution so nested LVM volumes on standalone disks (e.g., `sda3 -> /`) display their mountpoint in the expanded drive drawer.
+
+---
+
 ## [16.0.0] - 2026-11-02
 
 ### Added
