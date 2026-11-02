@@ -3,12 +3,11 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "raid"
-version = "16.1.0"
-description = "RAID Health Monitor: Interactive TUI & CLI MDADM software RAID & physical drive SMART health monitor"
-authors = [{name = "Nic"}]
+name = "mdamn"
+version = "17.0.0"
+description = "mdamn: Built-for-purpose Linux MDADM & SMART TUI/CLI"
 requires-python = ">=3.7"
 dependencies = []
 
 [project.scripts]
-raid = "raid:main"
+mdamn = "mdamn:main"

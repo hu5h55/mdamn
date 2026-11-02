@@ -1,9 +1,19 @@
 # Changelog
 
-All notable changes to the **RAID Health Monitor** (`raid.py`) will be documented in this file.
+All notable changes to **`mdamn`** (`mdamn.py`) will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [17.0.0] - 2026-11-02
+
+### Changed
+- **Rebrand to `mdamn`**:
+  - Renamed `raid.py` to `mdamn.py` and unified the CLI command, TUI header, modal titles, `pyproject.toml`, and `README.md` around **`mdamn`**.
+  - Removed legacy `raid` command aliases/symlinks to keep the utility single-purpose and unambiguous.
+  - Provisioned `/usr/local/bin/mdamn` and `/home/hu5h/.local/bin/mdamn`.
 
 ---
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
 ################################################################################
-# RAID Health Monitor
-# Version: 16.1.0 - Python (Interactive TUI + RAID Actions + (i) Impact Guide)
+# mdamn — Linux MDADM & SMART TUI/CLI
+# Version: 17.0.0
 ################################################################################
 
-VERSION = "16.1.0"
+VERSION = "17.0.0"
 
 import os
 import re
@@ -138,13 +138,18 @@ def check_privileges():
             print(f'Re-run with: {WHITE}sudo {script_path}{RESET} ({e})\n', file=sys.stderr)
             sys.exit(1)
     else:
-        usr_bin = '/usr/local/bin/raid'
-        target = os.path.realpath(__file__)
+        usr_bin = '/usr/local/bin/mdamn'
+        target  = os.path.realpath(__file__)
         if not os.path.exists(usr_bin) or os.path.realpath(usr_bin) != target:
             try:
                 if os.path.islink(usr_bin) or os.path.exists(usr_bin):
                     os.remove(usr_bin)
                 os.symlink(target, usr_bin)
+            except OSError:
+                pass
+        if os.path.islink('/usr/local/bin/raid'):
+            try:
+                os.remove('/usr/local/bin/raid')
             except OSError:
                 pass
 
@@ -1386,7 +1391,7 @@ def render_raid_modal(
     # Focused, zero-clutter Approval Window when a command is selected
     if checkpoint_act is not None:
         meta  = get_raid_action_info(checkpoint_act, r)
-        title = f'{YELLOW}{BOLD}Confirm Hardware Action: {md}{RESET}'
+        title = f'{YELLOW}{BOLD}mdamn Checkpoint — Confirm Hardware Action: {md}{RESET}'
         body  = [
             '',
             f'  {GRAY}Command:{RESET}  {WHITE}{BOLD}{meta["title"]}{RESET}',
@@ -1423,7 +1428,7 @@ def render_raid_modal(
 
         return make_box('  ', title, body, target_outer_w=layout['row_w'], border_col=YELLOW)
 
-    title = f'{BLUE}{BOLD}RAID Array Control & Telemetry: {md}{RESET}'
+    title = f'{BLUE}{BOLD}mdamn Array Control & Telemetry: {md}{RESET}'
     body  = [
         (
             f'{GRAY}State:{RESET}   {st_col}■ {BOLD}{su}{RESET} ({r["state_raw"]})   '
@@ -1557,7 +1562,7 @@ def run_interactive(telemetry):
             # Title Bar
             lines.append(
                 bg_wrap(
-                    f'  {BOLD}{WHITE}RAID Health Monitor{RESET} {GRAY}v{VERSION}{RESET}  '
+                    f'  {BOLD}{CYAN}mdamn{RESET} {GRAY}v{VERSION}{RESET}  '
                     f'{DARK_GRAY}│{RESET} {GRAY}↑/↓: Select  Enter: Actions/Details  '
                     f'a: Expand All  r: Refresh  q: Quit{RESET}'
                 )
@@ -1787,11 +1792,11 @@ def run_interactive(telemetry):
 ################################################################################
 
 def print_help():
-    print(f"""{BOLD}RAID Health Monitor{RESET} (v{VERSION})
+    print(f"""{BOLD}{CYAN}mdamn{RESET} {GRAY}v{VERSION} — Linux MDADM & SMART TUI/CLI{RESET}
 
 Usage:
-  raid [options]                 Launch interactive arrow-key TUI (default in terminal)
-  raid --static                  Print static summary and exit (for cron / MOTD scripts)
+  mdamn [options]                Launch interactive arrow-key TUI (default in terminal)
+  mdamn --static                 Print static summary and exit (for cron / MOTD scripts)
 
 Options:
   -s, --static                   Static non-interactive output (auto-enabled when piped/cron)
@@ -1803,11 +1808,11 @@ Options:
   -v, --version                  Show version information and exit
 
 Interactive Controls:
-  ↑ / ↓ (or k / j)               Move selection between RAID arrays and physical drives
-  Enter / Space                  Open RAID Action Menu (on RAID) or Expand SMART Details (on Drive)
-  i / ?                          Toggle (i) Information & Hardware Impact guide for any RAID action
+  ↑ / ↓ (or k / j)               Move selection between MDADM arrays and physical drives
+  Enter / Space                  Open Array Control Menu or Expand SMART Details
+  y / n / i                      Inside Action Checkpoint: Yes (Execute), No (Cancel), (i) Info & Impact
   a                              Expand / collapse all drive details
-  r / R                          Fast RAID refresh (r) or full SMART rescan (R)
+  r / R                          Fast MDADM refresh (r) or full SMART rescan (R)
   q / Esc                        Quit interactive view
 """)
 
@@ -1825,7 +1830,7 @@ def resolve_target_raids(arg_flag):
 
 def main():
     if '--version' in sys.argv or '-v' in sys.argv:
-        print(f"raid v{VERSION}")
+        print(f"mdamn v{VERSION}")
         sys.exit(0)
     if '--help' in sys.argv or '-h' in sys.argv:
         print_help()
