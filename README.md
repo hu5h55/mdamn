@@ -1,4 +1,4 @@
-# RAID Health Monitor (`raid`) (v16.0.1)
+# RAID Health Monitor (`raid`) (v16.1.0)
 
 An interactive terminal UI (TUI) and command-line health monitor & control suite for Linux **MDADM software RAID arrays** and physical drives.
 

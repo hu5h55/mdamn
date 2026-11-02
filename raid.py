@@ -2,10 +2,10 @@
 
 ################################################################################
 # RAID Health Monitor
-# Version: 16.0.1 - Python (Interactive TUI + RAID Actions + Static Mode)
+# Version: 16.1.0 - Python (Interactive TUI + RAID Actions + (i) Impact Guide)
 ################################################################################
 
-VERSION = "16.0.1"
+VERSION = "16.1.0"
 
 import os
 import re
@@ -17,6 +17,7 @@ import termios
 import select
 import shutil
 import signal
+import textwrap
 import subprocess
 from datetime import datetime, timedelta
 
@@ -49,7 +50,11 @@ def vis_len(s):
     return len(ANSI_RE.sub('', s))
 
 
-def make_box(indent, title_str, body_lines, target_outer_w=0):
+def fade_line(s):
+    return f'{DARK_GRAY}{ANSI_RE.sub("", s)}{RESET}'
+
+
+def make_box(indent, title_str, body_lines, target_outer_w=0, border_col=DARK_GRAY):
     """Render a closed rounded box (╭─── title ───╮ ... ╰────╯) with exact right-edge alignment."""
     title_vlen = vis_len(title_str)
     max_body   = max((vis_len(ln) for ln in body_lines if ln != 'SEP'), default=0)
@@ -57,14 +62,14 @@ def make_box(indent, title_str, body_lines, target_outer_w=0):
     inner_w    = max(min_inner, max_body + 2, title_vlen + 6)
 
     top_dashes = max(1, inner_w - title_vlen - 5)
-    out = [f'{indent}{DARK_GRAY}╭─── {RESET}{title_str}{DARK_GRAY} {"─" * top_dashes}╮{RESET}']
+    out = [f'{indent}{border_col}╭─── {RESET}{title_str}{border_col} {"─" * top_dashes}╮{RESET}']
     for ln in body_lines:
         if ln == 'SEP':
-            out.append(f'{indent}{DARK_GRAY}├{"─" * inner_w}┤{RESET}')
+            out.append(f'{indent}{border_col}├{"─" * inner_w}┤{RESET}')
         else:
             pad = max(0, inner_w - 2 - vis_len(ln))
-            out.append(f'{indent}{DARK_GRAY}│{RESET} {ln}{" " * pad} {DARK_GRAY}│{RESET}')
-    out.append(f'{indent}{DARK_GRAY}╰{"─" * inner_w}╯{RESET}')
+            out.append(f'{indent}{border_col}│{RESET} {ln}{" " * pad} {border_col}│{RESET}')
+    out.append(f'{indent}{border_col}╰{"─" * inner_w}╯{RESET}')
     return out
 
 
@@ -1204,11 +1209,219 @@ def build_raid_menu_options(r, show_raw_detail=False):
     return opts
 
 
-def render_raid_modal(r, layout, menu_idx, show_raw_detail=False, confirm_full=False, status_msg=None):
+def get_raid_action_info(act_key, r):
+    """Return structured (i) Information and (i) Hardware & Data Impact metadata for a RAID action."""
+    md_short = os.path.basename(r['md'])
+    sys_path = f'/sys/block/{md_short}/md'
+    total_d  = r['total']
+    size_str = r['size']
+    dev_sz   = r['dev_size']
+
+    catalog = {
+        'pause': {
+            'title':  'Pause Active Parity Check / Scrub',
+            'risk':   f'{GREEN}■ SAFE — Non-Destructive · Drops Drive I/O to Zero{RESET}',
+            'kernel': f'{sys_path}/{{sync_action="idle", sync_min=<cur_sector>}}',
+            'info':   (
+                'Gracefully halts the running parity scrub and bookmarks the exact 512-byte '
+                'sector offset in kernel RAM (sync_min). Zero array data or parity is modified.'
+            ),
+            'impact': (
+                f'Immediately drops sequential scrub read I/O across all {total_d} drives to zero. '
+                'Drive heads unload from continuous sweep, disk temperatures drop by ~2-5°C, '
+                'and 100% of I/O bandwidth is returned to user applications. (Bookmark resets on reboot.)'
+            ),
+        },
+        'resume': {
+            'title':  'Start / Resume Read-Only Parity Check',
+            'risk':   f'{GREEN}■ SAFE — 100% Read-Only Verification (Zero Disk Writes){RESET}',
+            'kernel': f'{sys_path}/{{sync_max="max", sync_action="check"}}',
+            'info':   (
+                'Instructs the Linux MD driver to read all data and parity stripes starting from '
+                'the saved sync_min sector offset and verify RAID parity math. Only increments '
+                'mismatch_cnt if a discrepancy is found; never overwrites data or parity.'
+            ),
+            'impact': (
+                f'Generates sustained sequential read I/O across all {total_d} member drives at the '
+                'active speed limit. Increases HDD head actuator duty, power draw, and drive temps '
+                '(+2-6°C), with minor latency on concurrent random I/O. Zero write wear.'
+            ),
+        },
+        'full_check': {
+            'title':  'Start Full Parity Check from 0.0%',
+            'risk':   f'{YELLOW}■ SAFE FOR DATA (Read-Only) — Full-Surface Mechanical Read Sweep{RESET}',
+            'kernel': f'{sys_path}/{{sync_min="0", sync_max="max", sync_action="check"}}',
+            'info':   (
+                'Discards any saved sync_min bookmark and starts a complete read-only parity '
+                f'verification across 100% of the {size_str} array from sector 0. Protected by '
+                'a [y/N] confirmation prompt when progress > 0%.'
+            ),
+            'impact': (
+                f'Reads every sector of all {total_d} drives ({dev_sz} per drive). At 200 MB/s, '
+                'this is a ~25-30h continuous sequential read sweep. 100% non-destructive to data, '
+                'but puts all drives through a full-surface read workload.'
+            ),
+        },
+        'stop_reset': {
+            'title':  'Stop Check & Reset Saved Sector Bookmark',
+            'risk':   f'{GREEN}■ SAFE — Non-Destructive · Clears Saved Scrub Position{RESET}',
+            'kernel': f'{sys_path}/{{sync_action="idle", sync_min="0", sync_max="max"}}',
+            'info':   (
+                'Immediately stops any running check/scrub and resets the saved sync_min sector '
+                'offset back to 0 so the next check starts from the beginning of the array.'
+            ),
+            'impact': (
+                'Halts background array I/O immediately and relieves drive thermal/mechanical load. '
+                'Does not modify user data or RAID superblocks; only clears the progress bookmark.'
+            ),
+        },
+        'repair': {
+            'title':  'Start Parity Repair Scrub (Rewrites Mismatched Parity)',
+            'risk':   f'{YELLOW}■ CAUTION — Writes to Disk if Parity Mismatches Exist{RESET}',
+            'kernel': f'{sys_path}/{{sync_action="repair"}} (Confirmation Required)',
+            'info':   (
+                'Reads all stripes like "check", but if any stripe has a parity mismatch, '
+                'recalculates parity from the data blocks and WRITES the new parity block to disk.'
+            ),
+            'impact': (
+                'Sustained sequential reads across all drives plus disk writes on mismatched stripes. '
+                'Only use when Mismatches > 0 after verifying SMART health on all drives—running '
+                'repair with a silently failing drive could overwrite valid parity.'
+            ),
+        },
+        'spd_quiet': {
+            'title':  'Speed Profile: Quiet / Background (Max 50 MB/s)',
+            'risk':   f'{GREEN}■ SAFE — Lowers Thermal & Mechanical Drive Stress{RESET}',
+            'kernel': f'{sys_path}/{{sync_speed_min="1000", sync_speed_max="50000"}} KB/s',
+            'info':   (
+                'Caps MD background scrub/sync throughput at 50 MB/s per drive (with a 1 MB/s '
+                'minimum floor when applications are actively reading/writing).'
+            ),
+            'impact': (
+                'Minimizes HDD head contention, acoustics, power draw, and heat during daytime or '
+                'production workloads, keeping filesystem latency low. Extends total scrub duration.'
+            ),
+        },
+        'spd_normal': {
+            'title':  'Speed Profile: System Default (Max 200 MB/s)',
+            'risk':   f'{GREEN}■ SAFE — Standard Linux MDADM Balanced Throttle{RESET}',
+            'kernel': f'{sys_path}/{{sync_speed_min="1000", sync_speed_max="200000"}} KB/s',
+            'info':   (
+                'Restores the standard Linux kernel scrub ceiling of 200 MB/s per drive and '
+                'automatically yields bandwidth whenever normal filesystem I/O is active.'
+            ),
+            'impact': (
+                'Balanced sequential read rate matched to 7200 RPM enterprise HDDs (~200-260 MB/s). '
+                'Moderate drive temperature rise (+3-5°C) while scrubbing; yields to user I/O.'
+            ),
+        },
+        'spd_turbo': {
+            'title':  'Speed Profile: Turbo / Unthrottled (Max 1,000 MB/s)',
+            'risk':   f'{YELLOW}■ MODERATE — Maximum Mechanical & Thermal Drive Load{RESET}',
+            'kernel': f'{sys_path}/{{sync_speed_min="200000", sync_speed_max="1000000"}} KB/s',
+            'info':   (
+                'Raises the minimum guaranteed scrub floor to 200 MB/s and ceiling to 1,000 MB/s, '
+                'forcing drives to scrub at full physical speed even during application I/O.'
+            ),
+            'impact': (
+                f'Saturates sequential HDD bandwidth (~240-270 MB/s per drive across all {total_d} '
+                'disks). Finishes scrubs in the shortest time, but maximizes drive temperatures, '
+                'power draw, and application I/O latency.'
+            ),
+        },
+        'toggle_raw': {
+            'title':  'Show / Hide Raw mdadm --detail Output',
+            'risk':   f'{CYAN}■ ZERO HARDWARE IMPACT — Read-Only UI Display{RESET}',
+            'kernel': 'None (renders cached mdadm --detail output)',
+            'info':   'Toggles the full raw mdadm --detail superblock and member table inside this modal.',
+            'impact': 'Zero disk I/O or hardware impact.',
+        },
+        'back': {
+            'title':  'Back to Main View',
+            'risk':   f'{CYAN}■ ZERO HARDWARE IMPACT — Navigation Only{RESET}',
+            'kernel': 'None',
+            'info':   'Closes the RAID Control Modal and returns to the main array and drive table.',
+            'impact': 'Zero disk I/O or hardware impact.',
+        },
+    }
+    return catalog.get(act_key, catalog['back'])
+
+
+def execute_raid_action(act_key, md):
+    """Execute the confirmed hardware/kernel RAID action and return (ok, status_msg)."""
+    if act_key == 'pause':
+        return action_pause_check(md)
+    elif act_key == 'resume':
+        return action_resume_check(md)
+    elif act_key == 'full_check':
+        return action_start_full_check(md)
+    elif act_key == 'stop_reset':
+        return action_stop_reset_check(md)
+    elif act_key == 'repair':
+        return action_start_repair(md)
+    elif act_key == 'spd_quiet':
+        return action_set_speed(md, 1000, 50000, 'Quiet (50 MB/s max)')
+    elif act_key == 'spd_normal':
+        return action_set_speed(md, 1000, 200000, 'System Default (200 MB/s max)')
+    elif act_key == 'spd_turbo':
+        return action_set_speed(md, 200000, 1000000, 'Turbo (1,000 MB/s max)')
+    return False, f"{md}: Unknown action."
+
+
+def render_raid_modal(
+    r,
+    layout,
+    menu_idx,
+    show_raw_detail=False,
+    show_action_info=False,
+    checkpoint_act=None,
+    checkpoint_btn=2,
+    status_msg=None,
+):
     tel    = r['sync_tel']
     md     = r['md']
     su     = r['su']
     st_col = r['state_col']
+
+    # Focused, zero-clutter Approval Window when a command is selected
+    if checkpoint_act is not None:
+        meta  = get_raid_action_info(checkpoint_act, r)
+        title = f'{YELLOW}{BOLD}Confirm Hardware Action: {md}{RESET}'
+        body  = [
+            '',
+            f'  {GRAY}Command:{RESET}  {WHITE}{BOLD}{meta["title"]}{RESET}',
+            f'  {GRAY}Safety:{RESET}   {meta["risk"]}',
+            '',
+        ]
+
+        btn_defs = [
+            (0, '[y] Yes, Execute', GREEN),
+            (1, '[n] No, Cancel',   RED),
+            (2, '[i] Hide Info & Impact' if show_action_info else '[i] Info & Impact', CYAN),
+        ]
+        rendered_btns = []
+        for b_idx, b_lbl, b_col in btn_defs:
+            if b_idx == checkpoint_btn:
+                rendered_btns.append(f'{BG_SEL}{b_col}{BOLD} ❯ {b_lbl} {RESET}')
+            else:
+                rendered_btns.append(f'   {b_col}{b_lbl}{RESET} ')
+        body.append('  ' + '    '.join(rendered_btns))
+        body.append('')
+
+        if show_action_info:
+            body.append('SEP')
+            body.append(f'  {GRAY}Sysfs:{RESET}    {WHITE}{meta["kernel"][:70]}{RESET}')
+            info_lines = textwrap.wrap(meta['info'], width=68)
+            for idx, iln in enumerate(info_lines):
+                prefix = f'  {GRAY}(i) Info:{RESET} ' if idx == 0 else '            '
+                body.append(f'{prefix}{WHITE}{iln}{RESET}')
+
+            impact_lines = textwrap.wrap(meta['impact'], width=68)
+            for idx, imln in enumerate(impact_lines):
+                prefix = f'  {GRAY}Impact:{RESET}   ' if idx == 0 else '            '
+                body.append(f'{prefix}{WHITE}{imln}{RESET}')
+
+        return make_box('  ', title, body, target_outer_w=layout['row_w'], border_col=YELLOW)
 
     title = f'{BLUE}{BOLD}RAID Array Control & Telemetry: {md}{RESET}'
     body  = [
@@ -1260,20 +1473,19 @@ def render_raid_modal(r, layout, menu_idx, show_raw_detail=False, confirm_full=F
         body.append(f'{col}{BOLD}➔ {msg}{RESET}')
 
     body.append('SEP')
-    if confirm_full:
-        body.append(
-            f'{YELLOW}{BOLD}! Confirm resetting scrub progress ({tel["pct"]:.1f}%) back to 0.0%? '
-            f'[y] Confirm / [n] Cancel{RESET}'
-        )
-    else:
-        body.append(f'{BOLD}{WHITE}Select Action (↑/↓ or hotkey, Enter to run, Esc to close):{RESET}')
-        opts = build_raid_menu_options(r, show_raw_detail)
-        for idx, (_, label) in enumerate(opts):
-            if idx == menu_idx:
-                lbl_bg = label.replace(RESET, RESET + BG_SEL)
-                body.append(f'  {BG_SEL}{CYAN}{BOLD}❯ {lbl_bg} {RESET}')
-            else:
-                body.append(f'    {WHITE}{label}{RESET}')
+    opts = build_raid_menu_options(r, show_raw_detail)
+    menu_idx = max(0, min(menu_idx, len(opts) - 1))
+
+    body.append(
+        f'{BOLD}{WHITE}Select Action '
+        f'{GRAY}(↑/↓: Move · Enter: Checkpoint [Yes / No / (i) Info & Impact]){WHITE}:{RESET}'
+    )
+    for idx, (_, label) in enumerate(opts):
+        if idx == menu_idx:
+            lbl_bg = label.replace(RESET, RESET + BG_SEL)
+            body.append(f'  {BG_SEL}{CYAN}{BOLD}❯ {lbl_bg} {RESET}')
+        else:
+            body.append(f'    {WHITE}{label}{RESET}')
 
     if show_raw_detail:
         body.append('SEP')
@@ -1286,14 +1498,16 @@ def render_raid_modal(r, layout, menu_idx, show_raw_detail=False, confirm_full=F
 
 
 def run_interactive(telemetry):
-    expanded_disks  = set()   # set of '/dev/sdX'
-    active_raid_md  = None    # '/dev/mdX' when RAID modal is open
-    raid_menu_idx   = 0
-    show_raw_detail = False
-    confirm_full    = False
-    status_msg      = None    # (bool, str)
-    cursor_idx      = 0
-    scroll_offset   = 0
+    expanded_disks   = set()   # set of '/dev/sdX'
+    active_raid_md   = None    # '/dev/mdX' when RAID modal is open
+    raid_menu_idx    = 0
+    show_raw_detail  = False
+    show_action_info = False
+    checkpoint_act   = None    # action key when at [Yes / No / (i) Info & Impact] checkpoint
+    checkpoint_btn   = 2       # 0=Yes, 1=No, 2=Info & Impact
+    status_msg       = None    # (bool, str)
+    cursor_idx       = 0
+    scroll_offset    = 0
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -1337,11 +1551,16 @@ def run_interactive(telemetry):
             lines = []
             selected_line_idx = 0
 
+            in_approval = (active_raid_md is not None and checkpoint_act is not None)
+            bg_wrap     = fade_line if in_approval else (lambda s: s)
+
             # Title Bar
             lines.append(
-                f'  {BOLD}{WHITE}RAID Health Monitor{RESET} {GRAY}v{VERSION}{RESET}  '
-                f'{DARK_GRAY}│{RESET} {GRAY}↑/↓: Select  Enter: Actions/Details  '
-                f'a: Expand All  r: Refresh  q: Quit{RESET}'
+                bg_wrap(
+                    f'  {BOLD}{WHITE}RAID Health Monitor{RESET} {GRAY}v{VERSION}{RESET}  '
+                    f'{DARK_GRAY}│{RESET} {GRAY}↑/↓: Select  Enter: Actions/Details  '
+                    f'a: Expand All  r: Refresh  q: Quit{RESET}'
+                )
             )
             lines.append(f'  {DARK_GRAY}' + '─' * max(10, layout['row_w'] - 2) + f'{RESET}')
 
@@ -1350,7 +1569,8 @@ def run_interactive(telemetry):
                 if is_raid_sel or active_raid_md == r['md']:
                     selected_line_idx = len(lines)
 
-                lines.extend(format_raid_lines(r, layout, selected=is_raid_sel, interactive=True))
+                for r_ln in format_raid_lines(r, layout, selected=is_raid_sel, interactive=True):
+                    lines.append(bg_wrap(r_ln))
 
                 if active_raid_md == r['md']:
                     lines.extend(
@@ -1358,44 +1578,48 @@ def run_interactive(telemetry):
                             r,
                             layout,
                             raid_menu_idx,
-                            show_raw_detail=show_raw_detail,
-                            confirm_full=confirm_full,
+                            show_raw_detail=(False if in_approval else show_raw_detail),
+                            show_action_info=show_action_info,
+                            checkpoint_act=checkpoint_act,
+                            checkpoint_btn=checkpoint_btn,
                             status_msg=status_msg,
                         )
                     )
 
                 if r['disks']:
-                    lines.append(format_disk_header(layout, '  '))
+                    lines.append(bg_wrap(format_disk_header(layout, '  ')))
                     for d in r['disks']:
                         is_d_sel = (sel_type == 'disk' and sel_id == d['dev'] and active_raid_md is None)
-                        is_d_exp = (d['dev'] in expanded_disks)
+                        is_d_exp = (not in_approval) and (d['dev'] in expanded_disks)
                         if is_d_sel:
                             selected_line_idx = len(lines)
-                        lines.append(format_disk_row(d, layout, selected=is_d_sel, expanded=is_d_exp, interactive=True))
+                        lines.append(bg_wrap(format_disk_row(d, layout, selected=is_d_sel, expanded=is_d_exp, interactive=True)))
                         if is_d_exp:
                             lines.extend(format_disk_expanded(d, layout))
                 lines.append('')
 
             if telemetry['standalone']:
-                lines.append(f'  {MAGENTA}■ Standalone Disks{RESET}')
-                lines.append(format_disk_header(layout, '  '))
+                lines.append(bg_wrap(f'  {MAGENTA}■ Standalone Disks{RESET}'))
+                lines.append(bg_wrap(format_disk_header(layout, '  ')))
                 for d in telemetry['standalone']:
                     is_d_sel = (sel_type == 'disk' and sel_id == d['dev'] and active_raid_md is None)
-                    is_d_exp = (d['dev'] in expanded_disks)
+                    is_d_exp = (not in_approval) and (d['dev'] in expanded_disks)
                     if is_d_sel:
                         selected_line_idx = len(lines)
-                    lines.append(format_disk_row(d, layout, selected=is_d_sel, expanded=is_d_exp, interactive=True))
+                    lines.append(bg_wrap(format_disk_row(d, layout, selected=is_d_sel, expanded=is_d_exp, interactive=True)))
                     if is_d_exp:
                         lines.extend(format_disk_expanded(d, layout))
                 lines.append('')
 
             if status_msg and active_raid_md is None:
                 ok, msg = status_msg
-                lines.append(f'  {GREEN if ok else RED}{BOLD}➔ {msg}{RESET}')
+                lines.append(bg_wrap(f'  {GREEN if ok else RED}{BOLD}➔ {msg}{RESET}'))
 
             lines.append(
-                f'  {GRAY}Last updated: {telemetry["updated_at"]} '
-                f'(Live RAID scrub telemetry refreshes every 2s · Press R for full SMART rescan){RESET}'
+                bg_wrap(
+                    f'  {GRAY}Last updated: {telemetry["updated_at"]} '
+                    f'(Live RAID scrub telemetry refreshes every 2s · Press R for full SMART rescan){RESET}'
+                )
             )
 
             # Viewport scrolling if content exceeds terminal height
@@ -1429,14 +1653,37 @@ def run_interactive(telemetry):
                     active_raid_md = None
                     continue
 
-                if confirm_full:
-                    if key in ('y', 'Y'):
-                        status_msg = action_start_full_check(active_raid_md)
-                        confirm_full = False
+                # 3-Choice Command Checkpoint: [y] Yes, Execute | [n] No, Cancel | [i] Info & Impact
+                if checkpoint_act is not None:
+                    if key in ('LEFT', 'UP', 'h', 'k'):
+                        checkpoint_btn = (checkpoint_btn - 1) % 3
+                    elif key in ('RIGHT', 'DOWN', 'l', 'j', '\t'):
+                        checkpoint_btn = (checkpoint_btn + 1) % 3
+                    elif key in ('y', 'Y'):
+                        status_msg = execute_raid_action(checkpoint_act, active_raid_md)
+                        checkpoint_act   = None
+                        show_action_info = False
                         refresh_raid_fast(telemetry)
                     elif key in ('n', 'N', 'ESC', 'BACKSPACE', 'q'):
-                        confirm_full = False
-                        status_msg = (False, f"{active_raid_md}: Full check reset cancelled.")
+                        meta_c = get_raid_action_info(checkpoint_act, r_obj)
+                        status_msg = (False, f"{active_raid_md}: Cancelled '{meta_c['title']}'.")
+                        checkpoint_act   = None
+                        show_action_info = False
+                    elif key in ('i', 'I', '?'):
+                        show_action_info = not show_action_info
+                    elif key in ('ENTER', 'SPACE'):
+                        if checkpoint_btn == 0:
+                            status_msg = execute_raid_action(checkpoint_act, active_raid_md)
+                            checkpoint_act   = None
+                            show_action_info = False
+                            refresh_raid_fast(telemetry)
+                        elif checkpoint_btn == 1:
+                            meta_c = get_raid_action_info(checkpoint_act, r_obj)
+                            status_msg = (False, f"{active_raid_md}: Cancelled '{meta_c['title']}'.")
+                            checkpoint_act   = None
+                            show_action_info = False
+                        else:
+                            show_action_info = not show_action_info
                     continue
 
                 opts = build_raid_menu_options(r_obj, show_raw_detail)
@@ -1456,45 +1703,39 @@ def run_interactive(telemetry):
                 elif key in ('DOWN', 'j'):
                     raid_menu_idx = (raid_menu_idx + 1) % len(opts)
                 elif key in ('ESC', 'BACKSPACE', 'q', 'LEFT'):
-                    active_raid_md  = None
-                    confirm_full    = False
-                    show_raw_detail = False
+                    active_raid_md   = None
+                    checkpoint_act   = None
+                    show_action_info = False
+                    show_raw_detail  = False
+                elif key in ('i', 'I', '?'):
+                    act_key = opts[raid_menu_idx][0]
+                    if act_key not in ('toggle_raw', 'back'):
+                        checkpoint_act   = act_key
+                        checkpoint_btn   = 2
+                        show_action_info = True
+                        status_msg       = None
                 elif key in ('ENTER', 'SPACE') or key in hotkey_map:
-                    act_key = hotkey_map[key] if key in hotkey_map else opts[raid_menu_idx][0]
-                    if act_key == 'pause':
-                        status_msg = action_pause_check(active_raid_md)
-                        refresh_raid_fast(telemetry)
-                    elif act_key == 'resume':
-                        status_msg = action_resume_check(active_raid_md)
-                        refresh_raid_fast(telemetry)
-                    elif act_key == 'full_check':
-                        tel_now = r_obj['sync_tel']
-                        if tel_now['cur_sectors'] > 0 or tel_now['sync_min'] > 0:
-                            confirm_full = True
-                        else:
-                            status_msg = action_start_full_check(active_raid_md)
-                            refresh_raid_fast(telemetry)
-                    elif act_key == 'stop_reset':
-                        status_msg = action_stop_reset_check(active_raid_md)
-                        refresh_raid_fast(telemetry)
-                    elif act_key == 'repair':
-                        status_msg = action_start_repair(active_raid_md)
-                        refresh_raid_fast(telemetry)
-                    elif act_key == 'spd_quiet':
-                        status_msg = action_set_speed(active_raid_md, 1000, 50000, 'Quiet (50 MB/s max)')
-                        refresh_raid_fast(telemetry)
-                    elif act_key == 'spd_normal':
-                        status_msg = action_set_speed(active_raid_md, 1000, 200000, 'System Default (200 MB/s max)')
-                        refresh_raid_fast(telemetry)
-                    elif act_key == 'spd_turbo':
-                        status_msg = action_set_speed(active_raid_md, 200000, 1000000, 'Turbo (1,000 MB/s max)')
-                        refresh_raid_fast(telemetry)
-                    elif act_key == 'toggle_raw':
+                    if key in hotkey_map:
+                        act_key = hotkey_map[key]
+                        for idx_o, (k_o, _) in enumerate(opts):
+                            if k_o == act_key:
+                                raid_menu_idx = idx_o
+                                break
+                    else:
+                        act_key = opts[raid_menu_idx][0]
+
+                    if act_key == 'toggle_raw':
                         show_raw_detail = not show_raw_detail
                     elif act_key == 'back':
-                        active_raid_md  = None
-                        confirm_full    = False
-                        show_raw_detail = False
+                        active_raid_md   = None
+                        checkpoint_act   = None
+                        show_action_info = False
+                        show_raw_detail  = False
+                    else:
+                        checkpoint_act   = act_key
+                        checkpoint_btn   = 2  # Default focus on [i] Info & Impact for hardware safety
+                        show_action_info = False
+                        status_msg       = None
                 continue
 
             # Main View Key Handling
@@ -1504,12 +1745,13 @@ def run_interactive(telemetry):
                 cursor_idx = (cursor_idx - 1) % len(items)
             elif key in ('DOWN', 'j'):
                 cursor_idx = (cursor_idx + 1) % len(items)
-            elif key in ('ENTER', 'SPACE', 'RIGHT'):
+            elif key in ('ENTER', 'SPACE', 'RIGHT', 'i', 'I'):
                 if sel_type == 'raid':
-                    active_raid_md  = sel_id
-                    raid_menu_idx   = 0
-                    confirm_full    = False
-                    status_msg      = None
+                    active_raid_md   = sel_id
+                    raid_menu_idx    = 0
+                    checkpoint_act   = None
+                    show_action_info = False
+                    status_msg       = None
                 elif sel_type == 'disk':
                     if sel_id in expanded_disks:
                         expanded_disks.remove(sel_id)
@@ -1563,6 +1805,7 @@ Options:
 Interactive Controls:
   ↑ / ↓ (or k / j)               Move selection between RAID arrays and physical drives
   Enter / Space                  Open RAID Action Menu (on RAID) or Expand SMART Details (on Drive)
+  i / ?                          Toggle (i) Information & Hardware Impact guide for any RAID action
   a                              Expand / collapse all drive details
   r / R                          Fast RAID refresh (r) or full SMART rescan (R)
   q / Esc                        Quit interactive view

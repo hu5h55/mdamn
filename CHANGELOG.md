@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [16.1.0] - 2026-11-02
+
+### Added
+- **3-Option Command Checkpoint (`[y] Yes, Execute` / `[n] No, Cancel` / `[i] Info & Impact`)**:
+  - Removed right-side `(i)` clutter from individual action menu rows and replaced it with a general header prompt (`Select Action (↑/↓: Move · Enter: Checkpoint [Yes / No / (i) Info & Impact]):`).
+  - Selecting **any** hardware/kernel command (`[p] Pause`, `[r] Resume`, `[f] Full Check`, `[x] Stop & Reset`, `[m] Parity Repair`, `[1] Quiet 50 MB/s`, `[2] System Default 200 MB/s`, `[3] Turbo 1,000 MB/s`) now opens a mandatory **Command Checkpoint** before touching sysfs or physical drives.
+  - Inside the checkpoint, you always have 3 choices (navigable via `←` / `→` + `Enter` or direct hotkeys `y`, `n`, `i`):
+    1. **`[y] Yes, Execute`** — Confirm and apply the command.
+    2. **`[n] No, Cancel`** — Abort safely and return to the action menu.
+    3. **`[i] Info & Impact`** — Expand/hide the detailed **(i) Information & Hardware Impact** drawer (Safety classification, exact `/sys/block/mdX/md/` target, driver behavior, and physical drive thermal/head/I/O impact) right inside the checkpoint before deciding `Yes` or `No`.
+  - Default cursor focus inside the checkpoint starts on **`[i] Info & Impact`** so accidentally double-pressing `Enter` never executes a hardware action.
+
+---
+
 ## [16.0.1] - 2026-11-02
 
 ### Improved & Fixed
