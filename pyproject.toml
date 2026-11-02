@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "raid"
-version = "15.0.1"
-description = "RAID Health Monitor: Real-time MDADM software RAID & physical drive SMART health monitor"
+version = "16.0.0"
+description = "RAID Health Monitor: Interactive TUI & CLI MDADM software RAID & physical drive SMART health monitor"
 authors = [{name = "Nic"}]
 requires-python = ">=3.7"
 dependencies = []
